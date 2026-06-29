@@ -4,7 +4,7 @@
 
 import sharp from "sharp";
 import { createWorker, createScheduler } from "tesseract.js";
-import { hasValidId } from "./extract.js";
+import { hasValidId, harvestIdNumbers } from "./extract.js";
 
 let scheduler = null;
 
@@ -132,5 +132,23 @@ export async function ocrBest(inputBuffer) {
       bestScore = score;
     }
   }
+
+  // If no ID number surfaced, do ONE higher-resolution sweep purely to recover
+  // it. The ID is format-identifiable, so we harvest only ID-shaped tokens and
+  // append them — the positional fields still come from the main pass above.
+  // Re-derive from the ORIGINAL input at 3000px (the main pass is capped lower,
+  // and small ID text needs the extra pixels), reusing the detected orientation.
+  if (!hasValidId(bestText)) {
+    const exifGray = await sharp(inputBuffer).rotate().grayscale().toBuffer();
+    const sweep = await rotate(exifGray, deg)
+      .resize({ width: 3000, height: 3000, fit: "inside", kernel: "cubic" })
+      .normalize()
+      .png()
+      .toBuffer();
+    const sweepText = await scheduler.addJob("recognize", sweep).then((r) => r.data.text);
+    const ids = harvestIdNumbers(sweepText);
+    if (ids.length) bestText += "\n" + ids.join("\n");
+  }
+
   return bestText;
 }

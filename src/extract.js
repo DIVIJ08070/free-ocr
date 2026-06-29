@@ -48,14 +48,23 @@ export function extractVoter(text) {
 }
 
 export function extractDl(text) {
-  // Canonical DL: SS RR YYYY NNNNNNN (e.g. MH12 20110012345 / GJ-05-2020-0001234)
+  // Canonical DL: SS RR YYYY NNNNNNN (e.g. MH12 20110012345 / GJ-05-2020-0001234).
+  // [\dOIl] in the numeric groups tolerates the common OCR confusions O->0 and
+  // I/l->1 (e.g. "ANO1 ..." for "AN01 ..."); we normalize them back below.
+  const D = "[\\dOIl]";
   const patterns = [
-    /\b([A-Z]{2}[-\s]?\d{2}[-\s]?(?:19|20)\d{2}[-\s]?\d{7})\b/,
-    /\b([A-Z]{2}\d{2}\s?\d{11})\b/,
+    new RegExp(`\\b([A-Z]{2}[-\\s]?${D}{2}[-\\s]?(?:19|20)${D}{2}[-\\s]?${D}{7})\\b`),
+    new RegExp(`\\b([A-Z]{2}${D}{2}\\s?${D}{11})\\b`),
   ];
   for (const p of patterns) {
     const m = text.match(p);
-    if (m) return m[1].replace(/[-\s]/g, "");
+    if (m) {
+      const raw = m[1].replace(/[-\s]/g, "");
+      // Keep the 2-letter state code as-is (it may legitimately contain O/I,
+      // e.g. OR/OD); normalize only the numeric tail.
+      const tail = raw.slice(2).replace(/[Oo]/g, "0").replace(/[Il]/g, "1");
+      return raw.slice(0, 2) + tail;
+    }
   }
   return null;
 }
@@ -80,14 +89,15 @@ export function extractDob(text) {
   m = text.match(/(?:YoB|Year of Birth)[:\s]*(\d{4})/i);
   if (m) return m[1];
 
-  // Fallback: first date that isn't labelled as an issue/validity/expiry date.
-  for (const d of text.matchAll(/\b(\d{2}[/-]\d{2}[/-]\d{4})\b/g)) {
-    const before = text.slice(Math.max(0, d.index - 22), d.index).toLowerCase();
-    if (/iss|valid|exp|renew/.test(before)) continue;
-    return d[1];
+  // No label (OCR often garbles it): the DOB is the EARLIEST-dated line — you
+  // are born before any issue/validity/expiry date on the document.
+  const dates = [...text.matchAll(/\b(\d{2})[/-](\d{2})[/-]((?:19|20)\d{2})\b/g)];
+  if (dates.length) {
+    let best = dates[0];
+    for (const d of dates) if (+d[3] < +best[3]) best = d;
+    return best[0];
   }
-  const any = text.match(/\b(\d{2}[/-]\d{2}[/-]\d{4})\b/);
-  return any ? any[1] : null;
+  return null;
 }
 
 export function extractGender(text) {
@@ -229,13 +239,20 @@ const HEADER_RE = /income\s*tax|govt|government|union|republic|election|driving|
 // ("Date of Birth" / "DOB" / "Year of Birth"); only then fall back to the first
 // plausible date, so issue/validity dates on a DL don't mis-anchor us.
 function findDobIdx(lines) {
-  let idx = lines.findIndex((l) => /date\s*of\s*birth|\bDOB\b|year\s*of\s*birth/i.test(l));
-  if (idx === -1) {
-    idx = lines.findIndex((l) =>
-      /\b(0[1-9]|[12]\d|3[01])[/-](0[1-9]|1[0-2])[/-](19|20)\d{2}\b/.test(l),
-    );
+  const idx = lines.findIndex((l) => /date\s*of\s*birth|\bDOB\b|year\s*of\s*birth/i.test(l));
+  if (idx !== -1) return idx;
+  // No label: the DOB line is the earliest-dated one (born before issue/validity).
+  const DATE = /\b(0[1-9]|[12]\d|3[01])[/-](0[1-9]|1[0-2])[/-]((?:19|20)\d{2})\b/;
+  let best = -1;
+  let bestYear = Infinity;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(DATE);
+    if (m && +m[3] < bestYear) {
+      bestYear = +m[3];
+      best = i;
+    }
   }
-  return idx;
+  return best;
 }
 
 // All name candidates between the header and the DOB line, top to bottom.
@@ -257,24 +274,38 @@ export function extractName(text, docType) {
   const start = headerIdx >= 0 ? headerIdx + 1 : 0;
   const end = dobIdx > start ? dobIdx : lines.length;
 
-  // PAN prints the cardholder name ABOVE the father's name (both above DOB),
-  // so take the TOPMOST candidate rather than the one closest to the date.
+  // PAN prints the cardholder name ABOVE the father's name (both above DOB), so
+  // take the TOPMOST candidate. Prefer multi-word names so single-word OCR junk
+  // ("SIRT") above the name can't be mistaken for it; fall back to single-word
+  // only when there's no multi-word candidate (single-name holders).
   if (docType === "PAN") {
     const cands = nameCandidates(lines, start, end);
-    if (cands.length) return cands[0];
+    const multi = cands.filter((c) => c.includes(" "));
+    const pick = multi.length ? multi : cands;
+    if (pick.length) return pick[0];
   }
 
-  // Everyone else: the name sits just above the DOB line — walk upward from it.
-  // Prefer a MULTI-word name ("Firdos Alam") over a closer single-word line,
-  // which is often OCR noise ("Sree") sitting between the name and the DOB.
-  if (dobIdx > 0) {
-    let single = null;
-    for (let i = dobIdx - 1; i >= start; i--) {
+  // Everyone else: the name sits NEAR the DOB — above on most cards, but BELOW
+  // it on some DLs. Search a window around the DOB line, prefer a MULTI-word
+  // name (over OCR noise like a single "Sree"), and among those take the one
+  // CLOSEST to the DOB line (so the cardholder wins over the father/guardian).
+  if (dobIdx >= 0) {
+    const lo = Math.max(start, dobIdx - 3);
+    const hi = Math.min(lines.length - 1, dobIdx + 3);
+    let multi = null, multiDist = Infinity;
+    let single = null, singleDist = Infinity;
+    for (let i = lo; i <= hi; i++) {
+      if (i === dobIdx) continue;
       const n = nameFromLine(lines[i]);
       if (!n) continue;
-      if (n.includes(" ")) return n; // multi-word — take it
-      if (!single) single = n; // remember closest single-word as fallback
+      const dist = Math.abs(i - dobIdx);
+      if (n.includes(" ")) {
+        if (dist < multiDist) { multi = n; multiDist = dist; }
+      } else if (dist < singleDist) {
+        single = n; singleDist = dist;
+      }
     }
+    if (multi) return multi;
     if (single) return single;
   }
 
@@ -295,36 +326,80 @@ export function extractName(text, docType) {
 // ---------------------------------------------------------------------
 const DATE = "(\\d{2}[/-]\\d{2}[/-]\\d{4})";
 
+// All full dates in the text, de-duped and sorted oldest -> newest.
+function sortedDates(text) {
+  const seen = new Set();
+  const out = [];
+  for (const m of text.matchAll(/\b(\d{2})[/-](\d{2})[/-]((?:19|20)\d{2})\b/g)) {
+    if (seen.has(m[0])) continue;
+    seen.add(m[0]);
+    out.push({ s: m[0], val: +m[3] * 10000 + +m[2] * 100 + +m[1] });
+  }
+  return out.sort((a, b) => a.val - b.val);
+}
+
 export function extractDlExtras(text) {
   const out = {};
 
-  // Father/guardian — "Son/Daughter/Wife of: NARAYAN ADHIKARY".
-  // Inter-word gap is horizontal whitespace only, so the name can't run onto
-  // the next line.
+  // --- Father/guardian ("Son/Daughter/Wife of: NAME") ---
   const g = text.match(/son[\s\/]*daughter[\s\/]*wife\s*of\b[ \t:]*([A-Z][A-Za-z]+(?:[ \t]+[A-Z][A-Za-z]+){0,2})/i);
-  if (g) out.guardian = g[1].trim();
+  if (g) {
+    out.guardian = g[1].trim();
+  } else {
+    // Label garbled by OCR — take the name printed just below the cardholder,
+    // skipping the (garbled) relation-label line itself.
+    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const holder = extractName(text, "DRIVING_LICENSE");
+    const hIdx = holder ? lines.findIndex((l) => nameFromLine(l) === holder) : -1;
+    if (hIdx !== -1) {
+      const REL = /\bof\b|daughter|daiagh|\bwife\b|wine|\bson\b|husband/i;
+      for (let i = hIdx + 1; i <= Math.min(lines.length - 1, hIdx + 4); i++) {
+        if (REL.test(lines[i])) continue; // skip the relation label line
+        const n = nameFromLine(lines[i]);
+        if (n && n !== holder) { out.guardian = n; break; }
+      }
+    }
+  }
 
-  // Issue / validity dates (best-effort — DL columns linearize unpredictably).
+  // --- Issue / validity dates ---
+  // Labels first; they often garble on DLs, so fall back to chronology:
+  // DOB < issue < validity, so among all dates the 2nd-oldest is the issue date
+  // and the newest is the validity.
   const iss = text.match(new RegExp(`(?:date\\s*of\\s*issue|issue\\s*date|first\\s*issue)\\b[^\\d]{0,15}${DATE}`, "i"));
   if (iss) out.issue_date = iss[1];
   const val = text.match(new RegExp(`valid(?:ity)?\\b[^\\d]{0,15}${DATE}`, "i"));
   if (val) out.validity = val[1];
+  if (!out.issue_date || !out.validity) {
+    const dates = sortedDates(text);
+    if (dates.length >= 3) {
+      if (!out.issue_date) out.issue_date = dates[1].s;
+      if (!out.validity) out.validity = dates[dates.length - 1].s;
+    } else if (dates.length === 2 && !out.validity) {
+      out.validity = dates[1].s; // DOB + one more → assume the later is validity
+    }
+  }
 
-  // Blood group. Prefer a real group (A/B/AB/O ±); if the OCR read something
-  // else (these stylised glyphs misread often), still surface the raw 1-2 char
-  // value flagged unverified so the field at least appears for manual checking.
+  // --- Blood group ---
+  // Prefer a labelled real group (A/B/AB/O ±). Else, if the label is garbled,
+  // look for a standalone group-with-sign token anywhere ("A+"). Else surface
+  // the raw value next to a readable label, flagged unverified.
   const bgValid = text.match(/blood\s*group\b[ \t:_-]*((?:AB|A|B|O)\s?[+\-]?)(?![A-Za-z])/i);
   if (bgValid) {
     out.blood_group = bgValid[1].replace(/\s+/g, "").toUpperCase();
   } else {
-    const bgRaw = text.match(/blood\s*group\b[ \t:_-]*([A-Za-z]{1,2}[+\-]?)\b/i);
-    if (bgRaw) {
-      out.blood_group = bgRaw[1].toUpperCase();
-      out.blood_group_verified = false;
+    const bgToken = text.match(/(?<![A-Za-z])(AB|A|B|O)\s?[+\-](?![A-Za-z])/);
+    if (bgToken) {
+      out.blood_group = bgToken[0].replace(/\s+/g, "").toUpperCase();
+    } else {
+      const bgRaw = text.match(/blood\s*group\b[ \t:_-]*([A-Za-z]{1,2}[+\-]?)\b/i);
+      if (bgRaw) {
+        out.blood_group = bgRaw[1].toUpperCase();
+        out.blood_group_verified = false;
+      }
     }
   }
 
-  // Organ donor Y/N.
+  // --- Organ donor Y/N ---
   const od = text.match(/organ\s*donor\b[\s:_-]*([YN]|yes|no)\b/i);
   if (od) out.organ_donor = /^y/i.test(od[1]) ? "Yes" : "No";
 
@@ -341,7 +416,9 @@ export function extractPanExtras(text) {
   const start = headerIdx >= 0 ? headerIdx + 1 : 0;
   const end = dobIdx > start ? dobIdx : lines.length;
   const cands = nameCandidates(lines, start, end);
-  if (cands.length >= 2) out.father_name = cands[1];
+  const multi = cands.filter((c) => c.includes(" "));
+  const pick = multi.length ? multi : cands;
+  if (pick.length >= 2) out.father_name = pick[1];
   return out;
 }
 
@@ -398,6 +475,24 @@ function idResult(spec, text) {
   const r = spec.idFunc(text);
   if (!r) return null;
   return typeof r === "string" ? { value: r } : r;
+}
+
+// ID-shaped tokens (any document), harvested from a supplementary OCR pass when
+// the main pass misses the number. Format-based, so reading order is irrelevant.
+const ID_PATTERNS = [
+  /\b[A-Z]{5}[0-9]{4}[A-Z]\b/g, // PAN
+  /\b[A-Z]{3}[0-9]{7}\b/g, // Voter
+  /\b[A-PR-WY][0-9]{7}\b/g, // Passport
+  /\b[A-Z]{2}[\dOIl]{2}\s?[\dOIl]{11}\b/g, // Driving licence
+  /\b\d{4}\s?\d{4}\s?\d{4}\b/g, // Aadhaar (12 digits)
+];
+
+export function harvestIdNumbers(text) {
+  const found = [];
+  for (const re of ID_PATTERNS) {
+    for (const m of text.matchAll(re)) found.push(m[0]);
+  }
+  return found;
 }
 
 // 1 if any known ID pattern is found (used to score OCR variants).
