@@ -30,16 +30,24 @@ export async function shutdownOcr() {
 
 const ROTATIONS = [0, 90, 180, 270];
 
-// EXIF-orient + grayscale + upscale small images once, into a buffer we can
-// cheaply re-rotate. EXIF orientation is baked in here so later manual rotations
+// Upscale target: phone photos of a card leave the actual text quite small
+// (a 1700px frame → ~25px-tall characters), which Tesseract reads poorly.
+// Enlarging the longest edge to ~2200px gives the text enough pixels that faint
+// glyphs (e.g. the blood group) read more reliably, without over-enlarging to
+// the point where page segmentation starts garbling lines. Larger inputs (good
+// scans) are left as-is.
+const OCR_TARGET_PX = 2200;
+
+// EXIF-orient + grayscale + upscale once, into a buffer we can cheaply
+// re-rotate. EXIF orientation is baked in here so later manual rotations
 // don't fight it.
 async function normalizedGray(inputBuffer) {
   const meta = await sharp(inputBuffer).metadata();
   const maxDim = Math.max(meta.width || 0, meta.height || 0);
   let p = sharp(inputBuffer).rotate().grayscale(); // .rotate() = EXIF auto-orient
-  if (maxDim && maxDim < 1200) {
-    const scale = 1200 / maxDim;
-    p = p.resize({ width: Math.round((meta.width || 0) * scale), kernel: "cubic" });
+  if (maxDim && maxDim < OCR_TARGET_PX) {
+    // fit:inside scales the longest edge to the target (orientation-safe).
+    p = p.resize({ width: OCR_TARGET_PX, height: OCR_TARGET_PX, fit: "inside", kernel: "cubic" });
   }
   return p.png().toBuffer();
 }

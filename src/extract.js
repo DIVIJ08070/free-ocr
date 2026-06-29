@@ -70,10 +70,24 @@ export function extractPassport(text) {
 // Shared fields across all document types
 // ---------------------------------------------------------------------
 export function extractDob(text) {
-  let m = text.match(/\b(\d{2}[/-]\d{2}[/-]\d{4})\b/);
+  // A DL/Passport carries several dates (issue, validity, DOB), so prefer a
+  // date that sits right after a Date-of-Birth label rather than the first one.
+  let m = text.match(
+    /(?:date\s+of\s+birth|\bd\.?\s?o\.?\s?b\b|\bbirth\b)[^\d]{0,15}(\d{2}[/-]\d{2}[/-]\d{4})/i,
+  );
   if (m) return m[1];
+
   m = text.match(/(?:YoB|Year of Birth)[:\s]*(\d{4})/i);
-  return m ? m[1] : null;
+  if (m) return m[1];
+
+  // Fallback: first date that isn't labelled as an issue/validity/expiry date.
+  for (const d of text.matchAll(/\b(\d{2}[/-]\d{2}[/-]\d{4})\b/g)) {
+    const before = text.slice(Math.max(0, d.index - 22), d.index).toLowerCase();
+    if (/iss|valid|exp|renew/.test(before)) continue;
+    return d[1];
+  }
+  const any = text.match(/\b(\d{2}[/-]\d{2}[/-]\d{4})\b/);
+  return any ? any[1] : null;
 }
 
 export function extractGender(text) {
@@ -86,10 +100,13 @@ export function extractGender(text) {
 // Indian PIN: 6 digits, never starts with 0, optionally printed "411 038".
 const PIN_RE = /\b[1-9]\d{2}\s?\d{3}\b/;
 
+// Lines that are clearly NOT part of an address — used to bound the upward walk.
+const ADDR_STOP =
+  /AADHAAR|GOVERNMENT|UIDAI|\bDOB\b|DATE OF BIRTH|GENDER|\bMALE\b|FEMALE|\bVID\b|\bSON\b|DAUGHTER|WIFE OF|VALIDITY|ISSUE|LICENCE|LICENSE|BLOOD GROUP|ORGAN DONOR|SIGNATURE|\d{4}\s\d{4}\s\d{4}/i;
+
 export function extractAddress(text) {
-  // Anchor on the PIN code, then walk upward gathering the address lines above
-  // it until we hit a non-address line. The PIN sits at the END of an address,
-  // so when several 6-digit numbers appear (amounts, IDs) we take the LAST one.
+  // The PIN code sits at the END of an address; when several 6-digit numbers
+  // appear (amounts, IDs) we take the LAST one as the anchor.
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   let pinIdx = -1;
   for (let i = 0; i < lines.length; i++) {
@@ -97,15 +114,40 @@ export function extractAddress(text) {
   }
   if (pinIdx === -1) return null;
 
-  const STOP = /AADHAAR|GOVERNMENT|UIDAI|\bDOB\b|GENDER|\bMALE\b|FEMALE|\bVID\b|\d{4}\s\d{4}\s\d{4}/i;
-  const collected = [];
-  for (let i = pinIdx; i >= 0 && collected.length < 3; i--) {
-    if (i !== pinIdx && STOP.test(lines[i])) break;
-    collected.unshift(lines[i]);
+  // Prefer an explicit "Address" label: take everything from there down to the
+  // PIN line. This excludes the "Son/Daughter/Wife of ..." relation line that
+  // sits above the address on a Driving Licence. The fuzzy form also catches
+  // common OCR misreads of the label ("Addr", "Addis", ...).
+  const ADDR_LABEL = /add(?:ress|r|is)/i;
+  let startIdx = -1;
+  for (let i = pinIdx; i >= 0; i--) {
+    if (ADDR_LABEL.test(lines[i])) {
+      startIdx = i;
+      break;
+    }
+  }
+
+  let collected;
+  if (startIdx !== -1) {
+    collected = lines.slice(startIdx, pinIdx + 1).slice(0, 6);
+    // Drop the label (and any garbled prefix before it) from the first line.
+    // `add\w*` consumes the whole label word even when OCR mangles it
+    // ("Addregg", "Addrss", ...) so its tail doesn't leak into the address.
+    collected[0] = collected[0].replace(/^.*?add\w*[^A-Za-z0-9]*/i, "");
+  } else {
+    // No label — walk upward from the PIN until a clearly non-address line.
+    collected = [];
+    for (let i = pinIdx; i >= 0 && collected.length < 3; i--) {
+      if (i !== pinIdx && ADDR_STOP.test(lines[i])) break;
+      collected.unshift(lines[i]);
+    }
   }
 
   const addr = collected
     .join(", ")
+    // Strip a leaked "Son/Daughter/Wife of <NAME>" relation prefix (DLs print it
+    // right before the address; OCR often merges it onto the same line).
+    .replace(/\bson\b[\s\/]*daughter[\s\/]*wife\s*of\b[\s:]*([A-Z][A-Za-z]+(\s+[A-Z][A-Za-z]+){0,2})?[\s,]*/i, "")
     .replace(/[^\w\s,.\-/]/g, " ") // strip OCR bracket/symbol junk
     .replace(/\s+/g, " ")
     .replace(/\s*,\s*/g, ", ")
@@ -121,8 +163,12 @@ const NAME_SKIP = [
   "PERMANENT", "ACCOUNT", "NUMBER", "FATHER", "DATE", "BIRTH",
   "MALE", "FEMALE", "AADHAAR", "UNIQUE", "AUTHORITY", "SIGNATURE",
   "ELECTION", "COMMISSION", "ELECTOR", "LICENCE", "LICENSE",
-  "TRANSPORT", "PASSPORT", "REPUBLIC", "ADDRESS",
+  "TRANSPORT", "PASSPORT", "REPUBLIC", "ADDRESS", "NAME",
 ];
+
+// A leading field label on a line ("Name :", "S/o", "D/O") — stripped so the
+// VALUE after it is read instead of the label word itself.
+const NAME_LABEL_RE = /^\s*(?:name|s\s*\/?\s*o|d\s*\/?\s*o|w\s*\/?\s*o)\b[\s:.\-\/]*/i;
 
 // A title-case name word (Firdos, Alam, D'Souza, O'Brien — apostrophe allowed
 // right after the leading cap) vs an all-caps one (RAMESH).
@@ -136,54 +182,180 @@ const isNameWord = (w) => (isTitleWord(w) || isUpperWord(w)) && w.length >= 3;
 // Pull a clean name out of one line: take the leading run of name words, then
 // STOP at the first token that isn't one. Accepts mixed casing within a name
 // ("Ramesh KUMAR") but the length>=3 rule strips trailing OCR junk like
-// "... TH pe" off "Firdos Alam".
+// "... TH pe" off "Firdos Alam". A leading single-letter initial ("D") is
+// skipped, and a lone name word is accepted only if it's long enough (>=4) to
+// be a real single name (e.g. "MANIKANDAN") rather than a stray OCR fragment.
 function nameFromLine(line) {
-  const words = line.split(/\s+/).filter(Boolean);
+  // Strip a leading field label ("Name :", "S/o", ...) so the value is read,
+  // and trim edge punctuation off each token ("ANY;" -> "ANY", "4" -> "").
+  const words = line
+    .replace(NAME_LABEL_RE, "")
+    .split(/\s+/)
+    .map((w) => w.replace(/^[^A-Za-z]+|[^A-Za-z]+$/g, ""))
+    .filter(Boolean);
   const out = [];
-  let started = false;
+  let style = null; // case of the last real name word: "T" (title) or "U" (upper)
   for (const w of words) {
-    if (!started) {
-      if (!isNameWord(w)) continue; // skip leading junk until a real name word
-      started = true;
+    if (out.length === 0) {
+      if (!isNameWord(w)) continue; // skip leading junk/initials until a real name word
       out.push(w);
+      style = isUpperWord(w) ? "U" : "T";
       continue;
     }
-    if (isNameWord(w) || isInitial(w)) out.push(w);
-    else break; // first non-name token ends the name
+    if (isInitial(w)) {
+      out.push(w); // middle initials don't change the case style
+      continue;
+    }
+    if (!isNameWord(w)) break; // first non-name token ends the name
+    const ws = isUpperWord(w) ? "U" : "T";
+    // A given+surname may switch case once (Ramesh KUMAR), but after two words a
+    // case switch signals trailing OCR junk ("Firdos Alam ESC") — stop there.
+    if (out.length >= 2 && ws !== style) break;
+    out.push(w);
+    style = ws;
   }
-  if (out.length < 2 || out.length > 4) return null;
+  if (out.length < 1 || out.length > 4) return null;
+  if (out.length === 1 && out[0].replace(/[^A-Za-z]/g, "").length < 4) return null;
   const joined = out.join(" ");
   if (NAME_SKIP.some((k) => joined.toUpperCase().includes(k))) return null;
   return joined;
 }
 
-export function extractName(text) {
-  // Best-effort name guess — weakest field, treat as "verify me".
-  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+// Header lines that mark the top of a card — name search starts below them so
+// title/garbage tokens up top can't be mistaken for the name.
+const HEADER_RE = /income\s*tax|govt|government|union|republic|election|driving|licen[cs]e|aadhaar|unique\s*identification|transport/i;
 
-  // The English name almost always sits just above the DOB/date line, so
-  // anchor there and walk upward — far more reliable than first-match top-down.
-  // Prefer an explicit DOB keyword; only fall back to a plausible-looking date
-  // (day 1-31, month 1-12) so stray serials/issue dates don't mis-anchor us.
-  let dobIdx = lines.findIndex((l) => /\bDOB\b|year of birth/i.test(l));
-  if (dobIdx === -1) {
-    dobIdx = lines.findIndex((l) =>
+// Index of the line carrying the date of birth. Prefer an explicit DOB label
+// ("Date of Birth" / "DOB" / "Year of Birth"); only then fall back to the first
+// plausible date, so issue/validity dates on a DL don't mis-anchor us.
+function findDobIdx(lines) {
+  let idx = lines.findIndex((l) => /date\s*of\s*birth|\bDOB\b|year\s*of\s*birth/i.test(l));
+  if (idx === -1) {
+    idx = lines.findIndex((l) =>
       /\b(0[1-9]|[12]\d|3[01])[/-](0[1-9]|1[0-2])[/-](19|20)\d{2}\b/.test(l),
     );
   }
+  return idx;
+}
+
+// All name candidates between the header and the DOB line, top to bottom.
+function nameCandidates(lines, start, end) {
+  const out = [];
+  for (let i = start; i < end; i++) {
+    const n = nameFromLine(lines[i]);
+    if (n) out.push(n);
+  }
+  return out;
+}
+
+export function extractName(text, docType) {
+  // Best-effort name guess — weakest field, treat as "verify me".
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+  const dobIdx = findDobIdx(lines);
+  const headerIdx = lines.findIndex((l) => HEADER_RE.test(l));
+  const start = headerIdx >= 0 ? headerIdx + 1 : 0;
+  const end = dobIdx > start ? dobIdx : lines.length;
+
+  // PAN prints the cardholder name ABOVE the father's name (both above DOB),
+  // so take the TOPMOST candidate rather than the one closest to the date.
+  if (docType === "PAN") {
+    const cands = nameCandidates(lines, start, end);
+    if (cands.length) return cands[0];
+  }
+
+  // Everyone else: the name sits just above the DOB line — walk upward from it.
+  // Prefer a MULTI-word name ("Firdos Alam") over a closer single-word line,
+  // which is often OCR noise ("Sree") sitting between the name and the DOB.
   if (dobIdx > 0) {
-    for (let i = dobIdx - 1; i >= 0; i--) {
+    let single = null;
+    for (let i = dobIdx - 1; i >= start; i--) {
       const n = nameFromLine(lines[i]);
-      if (n) return n;
+      if (!n) continue;
+      if (n.includes(" ")) return n; // multi-word — take it
+      if (!single) single = n; // remember closest single-word as fallback
+    }
+    if (single) return single;
+  }
+
+  // Fallback: first multi-word name below the header, else first single-word.
+  let single = null;
+  for (let i = start; i < lines.length; i++) {
+    const n = nameFromLine(lines[i]);
+    if (!n) continue;
+    if (n.includes(" ")) return n;
+    if (!single) single = n;
+  }
+  return single;
+}
+
+// ---------------------------------------------------------------------
+// Optional per-document extra fields. Each returns only the fields it finds,
+// so a record shows more detail when the document actually carries it.
+// ---------------------------------------------------------------------
+const DATE = "(\\d{2}[/-]\\d{2}[/-]\\d{4})";
+
+export function extractDlExtras(text) {
+  const out = {};
+
+  // Father/guardian — "Son/Daughter/Wife of: NARAYAN ADHIKARY".
+  // Inter-word gap is horizontal whitespace only, so the name can't run onto
+  // the next line.
+  const g = text.match(/son[\s\/]*daughter[\s\/]*wife\s*of\b[ \t:]*([A-Z][A-Za-z]+(?:[ \t]+[A-Z][A-Za-z]+){0,2})/i);
+  if (g) out.guardian = g[1].trim();
+
+  // Issue / validity dates (best-effort — DL columns linearize unpredictably).
+  const iss = text.match(new RegExp(`(?:date\\s*of\\s*issue|issue\\s*date|first\\s*issue)\\b[^\\d]{0,15}${DATE}`, "i"));
+  if (iss) out.issue_date = iss[1];
+  const val = text.match(new RegExp(`valid(?:ity)?\\b[^\\d]{0,15}${DATE}`, "i"));
+  if (val) out.validity = val[1];
+
+  // Blood group. Prefer a real group (A/B/AB/O ±); if the OCR read something
+  // else (these stylised glyphs misread often), still surface the raw 1-2 char
+  // value flagged unverified so the field at least appears for manual checking.
+  const bgValid = text.match(/blood\s*group\b[ \t:_-]*((?:AB|A|B|O)\s?[+\-]?)(?![A-Za-z])/i);
+  if (bgValid) {
+    out.blood_group = bgValid[1].replace(/\s+/g, "").toUpperCase();
+  } else {
+    const bgRaw = text.match(/blood\s*group\b[ \t:_-]*([A-Za-z]{1,2}[+\-]?)\b/i);
+    if (bgRaw) {
+      out.blood_group = bgRaw[1].toUpperCase();
+      out.blood_group_verified = false;
     }
   }
 
-  // Fallback: first qualifying line, top-down.
-  for (const line of lines) {
-    const n = nameFromLine(line);
-    if (n) return n;
-  }
-  return null;
+  // Organ donor Y/N.
+  const od = text.match(/organ\s*donor\b[\s:_-]*([YN]|yes|no)\b/i);
+  if (od) out.organ_donor = /^y/i.test(od[1]) ? "Yes" : "No";
+
+  return out;
+}
+
+export function extractPanExtras(text) {
+  // PAN prints NAME then FATHER'S NAME above the DOB; extractName takes the
+  // first, so the father's name is the second candidate.
+  const out = {};
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const dobIdx = findDobIdx(lines);
+  const headerIdx = lines.findIndex((l) => HEADER_RE.test(l));
+  const start = headerIdx >= 0 ? headerIdx + 1 : 0;
+  const end = dobIdx > start ? dobIdx : lines.length;
+  const cands = nameCandidates(lines, start, end);
+  if (cands.length >= 2) out.father_name = cands[1];
+  return out;
+}
+
+export function extractPassportExtras(text) {
+  const out = {};
+  const iss = text.match(new RegExp(`(?:date\\s*of\\s*issue|issue)\\b[^\\d]{0,15}${DATE}`, "i"));
+  if (iss) out.issue_date = iss[1];
+  const exp = text.match(new RegExp(`(?:date\\s*of\\s*expiry|expiry|valid\\s*until)\\b[^\\d]{0,15}${DATE}`, "i"));
+  if (exp) out.expiry_date = exp[1];
+  const pob = text.match(/place\s*of\s*birth\b[\s:]*([A-Z][A-Za-z .,]{2,40})/i);
+  if (pob) out.place_of_birth = pob[1].trim();
+  const poi = text.match(/place\s*of\s*issue\b[\s:]*([A-Z][A-Za-z .,]{2,40})/i);
+  if (poi) out.place_of_issue = poi[1].trim();
+  return out;
 }
 
 // ---------------------------------------------------------------------
@@ -194,6 +366,7 @@ export const DOC_TYPES = {
     keywords: ["INCOME TAX", "PERMANENT ACCOUNT", "PAN"],
     idField: "pan_number",
     idFunc: extractPan,
+    extras: extractPanExtras,
   },
   AADHAAR: {
     keywords: ["AADHAAR", "UNIQUE IDENTIFICATION", "UIDAI", "VID"],
@@ -209,11 +382,13 @@ export const DOC_TYPES = {
     keywords: ["DRIVING LICENCE", "DRIVING LICENSE", "TRANSPORT", "DL NO"],
     idField: "dl_number",
     idFunc: extractDl,
+    extras: extractDlExtras,
   },
   PASSPORT: {
     keywords: ["PASSPORT", "REPUBLIC OF INDIA", "P<IND"],
     idField: "passport_number",
     idFunc: extractPassport,
+    extras: extractPassportExtras,
   },
 };
 
@@ -257,7 +432,7 @@ export function detectAndExtract(text) {
 
   const record = {
     document_type: bestType || "UNKNOWN",
-    name: extractName(text),
+    name: extractName(text, bestType),
     dob: extractDob(text),
     gender: extractGender(text),
     address: extractAddress(text),
@@ -270,6 +445,12 @@ export function detectAndExtract(text) {
     if (bestType === "AADHAAR" && id) {
       record.aadhaar_verified = id.verified === true;
       if (id.masked) record.aadhaar_masked = true;
+    }
+    // Document-specific extra fields — only those actually found are added.
+    if (spec.extras) {
+      for (const [k, v] of Object.entries(spec.extras(text))) {
+        if (v != null && v !== "") record[k] = v;
+      }
     }
   }
 
