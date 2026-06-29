@@ -1,0 +1,7 @@
+node_modules/
+*.log
+.DS_Store
+ocr_output.json
+
+# Tesseract model data — re-downloaded automatically on npm install
+*.traineddata
