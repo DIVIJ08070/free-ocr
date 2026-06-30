@@ -12,9 +12,11 @@
     "node": ">=18.18"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.107.0",
     "express": "^4.19.2",
     "jsqr": "^1.4.0",
     "multer": "^2.0.0",
+    "openai": "^6.45.0",
     "pdf-to-png-converter": "^3.3.0",
     "sharp": "^0.33.4",
     "tesseract.js": "^5.1.0"

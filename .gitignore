@@ -5,3 +5,6 @@ ocr_output.json
 
 # Tesseract model data — re-downloaded automatically on npm install
 *.traineddata
+
+# Local secrets (Anthropic API key)
+.env

@@ -170,3 +170,74 @@ export async function ocrBest(inputBuffer) {
 
   return bestText;
 }
+
+// ── Business-card OCR ────────────────────────────────────────────────────────
+// Cards are often photographed with the text running sideways (printed rotated
+// 90°), and many are low-contrast (cream on olive, foil on dark, etc). The ID
+// path scores orientation by "valid ID present", which never fires on a card —
+// so cards need their own orientation signal and stronger contrast handling.
+
+// How "card-like" a reading is. An @email, a URL, or a long digit-run are almost
+// impossible to hallucinate from sideways text, so they decisively reward the
+// upright rotation; real words + letters + Tesseract confidence break ties.
+function cardScore(text, confidence) {
+  const t = text || "";
+  const words = (t.match(/\b[A-Za-z]{3,}\b/g) || []).length;
+  const letters = (t.match(/[A-Za-z]/g) || []).length;
+  const email = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.test(t) ? 1 : 0;
+  const url = /(?:https?:\/\/|www\.|\.com|\.in\b|\.org|\.net|\.co\b)/i.test(t) ? 1 : 0;
+  const phone = t.replace(/\D/g, "").length >= 8 ? 1 : 0;
+  return 90 * email + 35 * url + 25 * phone + 6 * words + 0.3 * letters + 0.4 * (confidence || 0);
+}
+
+const CARD_PROBE_PX = 1100;
+
+// Contrast-boosted preprocessing for a colored / low-contrast card.
+async function cardVariants(buf) {
+  const meta = await sharp(buf).metadata();
+  const win = Math.max(8, Math.min(64, meta.width || 64, meta.height || 64));
+  return Promise.all([
+    sharp(buf).normalize().linear(1.3, -28).sharpen().png().toBuffer(), // stretch + push apart
+    sharp(buf).clahe({ width: win, height: win }).png().toBuffer(),     // local contrast for uneven light
+    sharp(buf).normalize().png().toBuffer(),                            // plain stretch
+  ]);
+}
+
+export async function ocrCard(inputBuffer) {
+  if (!scheduler) throw new Error("OCR not initialized — call initOcr() first");
+  const grayBuf = await normalizedGray(inputBuffer);
+
+  // 1) Orientation probe: read all four 90° rotations (contrast-boosted, downscaled)
+  //    and keep the angle whose text scores most card-like.
+  const probes = await Promise.all(
+    ROTATIONS.map((deg) =>
+      rotate(grayBuf, deg)
+        .resize({ width: CARD_PROBE_PX, height: CARD_PROBE_PX, fit: "inside", withoutEnlargement: true })
+        .normalize()
+        .linear(1.3, -28)
+        .sharpen()
+        .png()
+        .toBuffer()
+        .then((buf) => ({ deg, buf })),
+    ),
+  );
+  const scored = await Promise.all(
+    probes.map(({ deg, buf }) =>
+      scheduler
+        .addJob("recognize", buf)
+        .then((r) => ({ deg, text: r.data.text, score: cardScore(r.data.text, r.data.confidence) })),
+    ),
+  );
+  scored.sort((a, b) => b.score - a.score);
+  const best = scored[0];
+
+  // 2) Full-resolution read at the chosen orientation; keep the best variant.
+  const oriented = await rotate(grayBuf, best.deg).png().toBuffer();
+  const vs = await cardVariants(oriented);
+  const reads = await Promise.all(
+    vs.map((v) => scheduler.addJob("recognize", v).then((r) => ({ text: r.data.text, score: cardScore(r.data.text, r.data.confidence) }))),
+  );
+  reads.push({ text: best.text, score: best.score }); // fall back to the probe text if variants do worse
+  reads.sort((a, b) => b.score - a.score);
+  return reads[0].text;
+}
