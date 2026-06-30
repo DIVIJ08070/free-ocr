@@ -21,12 +21,12 @@ try {
   /* no .env file — that's fine */
 }
 
-import { initOcr, ocrBest, ocrCard, shutdownOcr } from "./ocr.js";
+import { initOcr, ocrBest, ocrCardRich, shutdownOcr } from "./ocr.js";
 import { detectAndExtract } from "./extract.js";
 import { renderPdfToImages } from "./pdf.js";
 import { readAadhaarQr } from "./qr.js";
-import { extractCard, localWeak } from "./card.js";
-import { extractCardWithAI, aiAvailable, aiProvider } from "./ai.js";
+import { extractCard, extractCardSmart, localWeak } from "./card.js";
+import { extractCardWithAI, mapCardWithAI, aiAvailable, aiProvider } from "./ai.js";
 import { CARD_PAGE_HTML } from "./cardpage.js";
 
 // When an Aadhaar Secure QR decodes, its UIDAI-signed fields are ground truth —
@@ -582,26 +582,28 @@ app.post("/card", upload.any(), async (req, res) => {
   const mode = req.query.mode || req.body.mode || "local";
   const haveAi = aiAvailable();
   try {
-    // OCR every side; combine the text for the raw panel + local extraction.
-    const texts = await Promise.all(buffers.map((b) => ocrCard(b).catch(() => "")));
+    // OCR every side (with per-line geometry); combine text for the raw panel,
+    // and run layout-aware extraction across all sides.
+    const pages = await Promise.all(buffers.map((b) => ocrCardRich(b).catch(() => ({ text: "", lines: [] }))));
     const text =
       buffers.length > 1
-        ? texts.map((t, i) => `--- image ${i + 1} ---\n${t}`).join("\n\n")
-        : texts[0];
-    const local = extractCard(text);
+        ? pages.map((p, i) => `--- image ${i + 1} ---\n${p.text}`).join("\n\n")
+        : pages[0].text;
+    const local = extractCardSmart(pages);
 
     let rec = local;
     let aiUsed = false;
-    const wantAi = mode === "hybrid" || (mode === "auto" && localWeak(local));
+    // When AI assist is on, map the (already local, free) OCR text → fields with a
+    // cheap text model — no image sent. Rules stay as an instant fallback.
+    const wantAi = mode !== "local";
     if (wantAi && haveAi) {
       try {
-        rec = await extractCardWithAI(buffers); // all sides sent together → merged
-        if (mode === "auto") rec.escalated = true;
+        rec = await mapCardWithAI(text);
         aiUsed = true;
       } catch (e) {
         // AI hiccup (rate limit / bad reply / network) — never fail the request.
         rec = local;
-        rec.ai_note = "AI step failed, showing local result — " + e.message;
+        rec.ai_note = "AI mapping failed, showing local result — " + e.message;
       }
     } else if (wantAi && !haveAi) {
       rec.ai_note = "AI requested but no API key set (GROQ / XAI / OPENAI / ANTHROPIC).";

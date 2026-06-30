@@ -13,9 +13,12 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.107.0",
+    "@gutenye/ocr-node": "^1.4.8",
+    "@techstark/opencv-js": "^5.0.0-release.1",
     "express": "^4.19.2",
     "jsqr": "^1.4.0",
     "multer": "^2.0.0",
+    "onnxruntime-node": "^1.19.2",
     "openai": "^6.45.0",
     "pdf-to-png-converter": "^3.3.0",
     "sharp": "^0.33.4",

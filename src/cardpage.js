@@ -237,10 +237,11 @@ export const CARD_PAGE_HTML = `<!doctype html>
       var w=steps[si];
       if(!erasing){
         spintxt.textContent=w.slice(0,++ci);
-        if(ci>=w.length){erasing=true;setTimeout(tick,820);}else setTimeout(tick,42+Math.random()*34);
+        if(ci>=w.length){ if(si>=steps.length-1) return; erasing=true; setTimeout(tick,820); } // last step: hold, don't loop
+        else setTimeout(tick,42+Math.random()*34);
       }else{
         spintxt.textContent=w.slice(0,--ci);
-        if(ci<=0){erasing=false;si=(si+1)%steps.length;setTimeout(tick,180);}else setTimeout(tick,22);
+        if(ci<=0){erasing=false;si++;setTimeout(tick,180);}else setTimeout(tick,22);
       }
     })();
   }
@@ -280,7 +281,12 @@ export const CARD_PAGE_HTML = `<!doctype html>
     go.disabled=true;spin.style.display='flex';result.style.display='none';
     startSteps(useAI);
     fetch('/card?mode='+(useAI?'auto':'local'),{method:'POST',body:fd})
-      .then(function(r){return r.json()}).then(function(d){if(d.error)renderErr(d.error);else render(d)})
+      .then(function(r){return r.text().then(function(t){
+        if(!r.ok) throw new Error('Server error '+r.status);
+        if(!t) throw new Error('No response — the scan may have timed out. Try one image at a time.');
+        try{ return JSON.parse(t); }catch(_){ throw new Error('Unreadable response from server.'); }
+      });})
+      .then(function(d){if(d.error)renderErr(d.error);else render(d)})
       .catch(function(e){renderErr(e.message)}).then(function(){stopSteps();go.disabled=false;spin.style.display='none'});
   });
 
