@@ -5,9 +5,36 @@ import { verhoeffValid } from "./verhoeff.js";
 // ---------------------------------------------------------------------
 // Per-document ID extractors
 // ---------------------------------------------------------------------
+// OCR character-confusion maps, applied ONLY at known-grammar positions of an
+// ID (never to free text), to repair a single misread like O->0 or I->1.
+const TO_DIGIT = { O: "0", D: "0", Q: "0", I: "1", L: "1", Z: "2", S: "5", B: "8", G: "6", T: "7" };
+const TO_ALPHA = { "0": "O", "1": "I", "2": "Z", "5": "S", "8": "B", "6": "G" };
+
+// Coerce a token to a position mask ("A"=letter, "D"=digit), counting how many
+// chars had to change. Returns null if it can't be made to fit.
+function coerceId(tok, mask) {
+  if (tok.length !== mask.length) return null;
+  let out = "";
+  let edits = 0;
+  for (let i = 0; i < mask.length; i++) {
+    const c = tok[i];
+    const want = mask[i] === "D" ? (TO_DIGIT[c] ?? c) : (TO_ALPHA[c] ?? c);
+    if (!(mask[i] === "D" ? /[0-9]/ : /[A-Z]/).test(want)) return null;
+    if (want !== c) edits++;
+    out += want;
+  }
+  return { value: out, edits };
+}
+
+// PAN 4th char = holder type; a valid one is our confidence signal (PAN has no
+// checksum). 5 letters + 4 digits + 1 letter.
+const PAN_HOLDER = "ABCFGHJLPT";
 export function extractPan(text) {
-  const m = text.match(/\b[A-Z]{5}[0-9]{4}[A-Z]\b/);
-  return m ? m[0] : null;
+  for (const tok of text.toUpperCase().match(/\b[A-Z0-9]{10}\b/g) || []) {
+    const r = coerceId(tok, "AAAAADDDDA");
+    if (r && r.edits <= 2) return { value: r.value, verified: PAN_HOLDER.includes(r.value[3]) };
+  }
+  return null;
 }
 
 export function extractAadhaar(text) {
@@ -43,8 +70,13 @@ export function extractAadhaar(text) {
 }
 
 export function extractVoter(text) {
-  const m = text.match(/\b[A-Z]{3}[0-9]{7}\b/);
-  return m ? m[0] : null;
+  // EPIC: 3 letters + 7 digits. No checksum — a clean read (no repairs) is our
+  // confidence signal.
+  for (const tok of text.toUpperCase().match(/\b[A-Z0-9]{10}\b/g) || []) {
+    const r = coerceId(tok, "AAADDDDDDD");
+    if (r && r.edits <= 1) return { value: r.value, verified: r.edits === 0 };
+  }
+  return null;
 }
 
 export function extractDl(text) {
@@ -70,9 +102,15 @@ export function extractDl(text) {
 }
 
 export function extractPassport(text) {
-  // Indian passport: 1 letter + 7 digits (e.g. A1234567).
-  const m = text.match(/\b([A-PR-WY][0-9]{7})\b/);
-  return m ? m[1] : null;
+  // Indian passport: 1 letter (A-PR-WY) + 7 digits (e.g. A1234567). Short, so
+  // allow at most one repair; a clean read is the confidence signal.
+  for (const tok of text.toUpperCase().match(/\b[A-Z0-9]{8}\b/g) || []) {
+    const r = coerceId(tok, "ADDDDDDD");
+    if (r && r.edits <= 1 && /[A-PR-WY]/.test(r.value[0])) {
+      return { value: r.value, verified: r.edits === 0 };
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------
@@ -495,6 +533,19 @@ export function harvestIdNumbers(text) {
   return found;
 }
 
+// True only if a STRICT, unrepaired ID format is present. Used to decide
+// whether the high-res ID sweep is needed (the loose, confusion-tolerant
+// extractors would otherwise fire on garbage and skip a needed sweep).
+export function hasStrictId(text) {
+  return (
+    /\b[A-Z]{5}[0-9]{4}[A-Z]\b/.test(text) || // PAN
+    /\b[A-Z]{3}[0-9]{7}\b/.test(text) || // Voter
+    /\b[A-PR-WY][0-9]{7}\b/.test(text) || // Passport
+    /\b[A-Z]{2}\d{2}\s?\d{11}\b/.test(text) || // Driving licence
+    /\b\d{4}\s?\d{4}\s?\d{4}\b/.test(text) // Aadhaar (12 digits)
+  );
+}
+
 // 1 if any known ID pattern is found (used to score OCR variants).
 // A checksum-failing Aadhaar doesn't count here, so variant selection still
 // prefers a reading where the number passes Verhoeff.
@@ -537,9 +588,11 @@ export function detectAndExtract(text) {
     const spec = DOC_TYPES[bestType];
     const id = idResult(spec, text);
     record[spec.idField] = id ? id.value : null;
-    if (bestType === "AADHAAR" && id) {
-      record.aadhaar_verified = id.verified === true;
-      if (id.masked) record.aadhaar_masked = true;
+    if (id) {
+      // pan_number -> "pan", aadhaar_number -> "aadhaar", voter_id -> "voter", ...
+      const base = spec.idField.replace(/_(number|id)$/, "");
+      if (id.verified !== undefined) record[`${base}_verified`] = id.verified === true;
+      if (id.masked) record[`${base}_masked`] = true;
     }
     // Document-specific extra fields — only those actually found are added.
     if (spec.extras) {

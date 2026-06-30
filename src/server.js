@@ -11,8 +11,35 @@ import multer from "multer";
 import { initOcr, ocrBest, shutdownOcr } from "./ocr.js";
 import { detectAndExtract } from "./extract.js";
 import { renderPdfToImages } from "./pdf.js";
+import { readAadhaarQr } from "./qr.js";
 
-const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"]);
+// When an Aadhaar Secure QR decodes, its UIDAI-signed fields are ground truth —
+// override the OCR-guessed name/DOB/gender/address with them.
+function applyQr(rec, qr) {
+  if (!qr) return rec;
+  rec.document_type = "AADHAAR";
+  rec.name = qr.name;
+  rec.dob = qr.dob;
+  if (qr.gender) rec.gender = qr.gender;
+  if (qr.address) rec.address = qr.address;
+  // Number: prefer a full checksum-verified one — from QR if it has it, else
+  // keep OCR's verified number, else fall back to the QR's masked last-4.
+  if (qr.aadhaar_verified) {
+    rec.aadhaar_number = qr.aadhaar_number;
+    rec.aadhaar_verified = true;
+    delete rec.aadhaar_masked;
+  } else if (!(rec.aadhaar_number && rec.aadhaar_verified)) {
+    rec.aadhaar_number = qr.aadhaar_number;
+    if (qr.aadhaar_masked) rec.aadhaar_masked = true;
+  }
+  rec.source = "qr";
+  return rec;
+}
+
+const IMAGE_EXTS = new Set([
+  ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp",
+  ".avif", ".heic", ".heif", ".gif",
+]);
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -26,52 +53,102 @@ const LANDING_HTML = `<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Indian ID OCR</title>
+  <title>CardSense — Smart ID Reader</title>
   <style>
-    :root { --bg:#0f172a; --card:#1e293b; --line:#334155; --txt:#e2e8f0; --muted:#94a3b8; --accent:#6366f1; --ok:#22c55e; --err:#ef4444; }
-    * { box-sizing: border-box; }
-    body { font: 15px/1.5 system-ui, -apple-system, sans-serif; margin: 0; background: var(--bg); color: var(--txt); }
-    .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 64px; }
-    header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px; }
-    h1 { font-size: 22px; margin: 0; }
-    .status { color: var(--ok); font-size: 13px; font-weight: 600; }
-    .sub { color: var(--muted); margin: 0 0 24px; font-size: 14px; }
-    #drop { border: 2px dashed var(--line); border-radius: 12px; padding: 40px 20px; text-align: center; cursor: pointer; transition: .15s; background: var(--card); }
-    #drop.over { border-color: var(--accent); background: #232f4b; }
-    #drop p { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
-    #drop strong { color: var(--txt); }
-    .files { list-style: none; padding: 0; margin: 16px 0 0; }
-    .files li { display: flex; justify-content: space-between; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 13px; }
-    .files .sz { color: var(--muted); }
-    .row { display: flex; align-items: center; gap: 16px; margin: 18px 0; flex-wrap: wrap; }
-    button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 10px 20px; font-size: 15px; font-weight: 600; cursor: pointer; }
-    button:disabled { opacity: .5; cursor: default; }
-    label.chk { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 14px; cursor: pointer; }
-    .results { margin-top: 24px; }
-    .rec { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 14px; }
-    .rec.err { border-color: var(--err); }
-    .rec h3 { margin: 0 0 4px; font-size: 15px; }
-    .rec .meta { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
-    .badge { display: inline-block; background: var(--accent); color: #fff; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; vertical-align: middle; margin-left: 8px; }
-    table { width: 100%; border-collapse: collapse; font-size: 14px; }
-    td { padding: 5px 8px; border-top: 1px solid var(--line); vertical-align: top; }
-    td.k { color: var(--muted); width: 160px; }
-    td.v { font-family: ui-monospace, monospace; }
-    .raw { margin-top: 10px; }
-    .raw summary { cursor: pointer; color: var(--muted); font-size: 13px; }
-    .raw pre { background: #0b1222; border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow-x: auto; font-size: 12px; white-space: pre-wrap; }
-    .errmsg { color: var(--err); }
-    .spin { display: none; color: var(--muted); font-size: 14px; }
+    :root{
+      --bg:#080b16; --panel:rgba(22,30,48,.6); --panel2:#141b2d;
+      --line:rgba(148,163,184,.14); --line2:rgba(148,163,184,.24);
+      --txt:#eaf0fb; --muted:#8a96ad;
+      --accent:#7c8cff; --accent2:#a984ff; --ok:#34d399; --err:#fb7185; --warn:#fbbf24;
+      --radius:16px;
+    }
+    *{box-sizing:border-box}
+    body{
+      font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;
+      margin:0; color:var(--txt); min-height:100vh;
+      background:
+        radial-gradient(900px 520px at 12% -12%, rgba(124,140,255,.20), transparent 60%),
+        radial-gradient(820px 520px at 102% 0%, rgba(169,132,255,.15), transparent 55%),
+        var(--bg);
+      background-attachment:fixed; -webkit-font-smoothing:antialiased;
+    }
+    .wrap{max-width:840px; margin:0 auto; padding:48px 20px 80px}
+    header{display:flex; align-items:center; gap:14px; margin-bottom:6px}
+    .logo{width:42px; height:42px; border-radius:12px; display:grid; place-items:center; font-size:22px;
+      background:linear-gradient(135deg,var(--accent),var(--accent2)); box-shadow:0 8px 30px rgba(124,140,255,.45)}
+    h1{font-size:24px; font-weight:700; margin:0; letter-spacing:-.02em}
+    .status{margin-left:auto; display:flex; align-items:center; gap:7px; font-size:12.5px; font-weight:600;
+      color:var(--ok); background:rgba(52,211,153,.1); border:1px solid rgba(52,211,153,.25);
+      padding:5px 12px; border-radius:999px}
+    .status .dot{width:8px; height:8px; border-radius:50%; background:var(--ok);
+      box-shadow:0 0 10px var(--ok); animation:pulse 2s infinite}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+    .sub{color:var(--muted); margin:4px 0 28px; font-size:14px}
+    #drop{background:var(--panel); border:1.5px dashed var(--line2); border-radius:var(--radius);
+      backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+      padding:46px 24px; text-align:center; cursor:pointer; transition:.2s}
+    #drop:hover{border-color:var(--accent)}
+    #drop.over{border-color:var(--accent); background:rgba(124,140,255,.08);
+      box-shadow:0 0 0 4px rgba(124,140,255,.12) inset}
+    .up-ic{font-size:32px; display:block; margin-bottom:10px; filter:drop-shadow(0 6px 16px rgba(124,140,255,.5))}
+    #drop b{color:var(--txt); font-weight:600}
+    #drop .hint{margin:8px 0 0; color:var(--muted); font-size:13px}
+    .files{list-style:none; padding:0; margin:14px 0 0; display:flex; flex-wrap:wrap; gap:8px}
+    .files li{display:flex; align-items:center; gap:8px; background:var(--panel2); border:1px solid var(--line);
+      border-radius:10px; padding:7px 12px; font-size:13px}
+    .files .sz{color:var(--muted)}
+    .row{display:flex; align-items:center; gap:18px; margin:22px 0; flex-wrap:wrap}
+    button{font:inherit; font-weight:600; font-size:15px; color:#fff; border:0; cursor:pointer;
+      padding:12px 28px; border-radius:12px; background:linear-gradient(135deg,var(--accent),var(--accent2));
+      box-shadow:0 10px 28px rgba(124,140,255,.4); transition:.18s}
+    button:hover:not(:disabled){transform:translateY(-1px); box-shadow:0 14px 34px rgba(124,140,255,.55)}
+    button:disabled{opacity:.45; cursor:default; box-shadow:none}
+    label.chk{display:flex; align-items:center; gap:8px; color:var(--muted); font-size:14px; cursor:pointer; user-select:none}
+    label.chk input{accent-color:var(--accent); width:16px; height:16px}
+    .spin{display:none; align-items:center; gap:10px; color:var(--muted); font-size:13.5px}
+    .spin .sp{width:18px; height:18px; border-radius:50%; border:2.5px solid rgba(148,163,184,.25);
+      border-top-color:var(--accent); animation:spin .8s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .results{margin-top:26px; display:flex; flex-direction:column; gap:16px}
+    .rec{background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+      backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); padding:20px 22px; position:relative; overflow:hidden}
+    .rec::before{content:""; position:absolute; inset:0 0 auto 0; height:3px;
+      background:linear-gradient(90deg,var(--accent),var(--accent2))}
+    .rec.err::before{background:var(--err)}
+    .rec-head{display:flex; align-items:center; gap:12px; margin-bottom:14px}
+    .rec-head .fn{font-weight:600; font-size:15px; word-break:break-all}
+    .rec-head .pg{color:var(--muted); font-size:12px}
+    .badge{margin-left:auto; flex:none; font-size:11px; font-weight:700; letter-spacing:.04em;
+      padding:5px 11px; border-radius:999px; color:#fff; background:linear-gradient(135deg,var(--accent),var(--accent2))}
+    dl{margin:0; display:grid; grid-template-columns:150px 1fr}
+    dt{color:var(--muted); font-size:13.5px; padding:9px 0; border-top:1px solid var(--line)}
+    dd{margin:0; padding:9px 0; border-top:1px solid var(--line);
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:14px; word-break:break-word}
+    .chip{display:inline-block; font-family:inherit; font-size:11.5px; font-weight:700; padding:3px 10px; border-radius:999px}
+    .chip.ok{color:var(--ok); background:rgba(52,211,153,.12); border:1px solid rgba(52,211,153,.3)}
+    .chip.warn{color:var(--warn); background:rgba(251,191,36,.12); border:1px solid rgba(251,191,36,.3)}
+    .muted{color:var(--muted)}
+    .raw{margin-top:14px; border-top:1px solid var(--line); padding-top:12px}
+    .raw summary{cursor:pointer; color:var(--muted); font-size:13px}
+    .raw pre{background:#05080f; border:1px solid var(--line); border-radius:10px; padding:14px; overflow-x:auto;
+      font-size:12px; line-height:1.5; white-space:pre-wrap; margin:10px 0 0; color:#aeb8cc}
+    .errmsg{color:var(--err); font-size:14px}
+    .empty{color:var(--muted); font-size:13.5px; text-align:center; padding:8px}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <header><h1>Indian ID OCR</h1><span class="status">● running</span></header>
-    <p class="sub">PAN · Aadhaar · Voter ID · Driving License · Passport — 100% offline.</p>
+    <header>
+      <div class="logo">🪪</div>
+      <h1>CardSense</h1>
+      <span class="status"><span class="dot"></span> online</span>
+    </header>
+    <p class="sub">Smart offline ID card reader — PAN · Aadhaar · Voter ID · Driving Licence · Passport. No cloud, no API.</p>
 
     <div id="drop">
-      <strong>Click to choose files</strong> or drag &amp; drop here
-      <p>images (jpg, png, tiff, webp…) or PDFs — up to 25 files</p>
+      <span class="up-ic">⬆️</span>
+      <b>Click to choose files</b> or drag &amp; drop here
+      <p class="hint">images (JPG, PNG, TIFF, WEBP…) or PDFs — up to 25 files</p>
       <input id="file" type="file" multiple accept="image/*,application/pdf" hidden />
     </div>
     <ul class="files" id="filelist"></ul>
@@ -79,7 +156,7 @@ const LANDING_HTML = `<!doctype html>
     <div class="row">
       <button id="go" disabled>Run OCR</button>
       <label class="chk"><input type="checkbox" id="raw" /> include raw OCR text</label>
-      <span class="spin" id="spin">⏳ processing… (first run loads OCR models, can take a bit)</span>
+      <span class="spin" id="spin"><span class="sp"></span> processing… first run loads the OCR model</span>
     </div>
 
     <div class="results" id="results"></div>
@@ -98,7 +175,7 @@ const LANDING_HTML = `<!doctype html>
 
     function setFiles(list) {
       files = Array.from(list);
-      fileList.innerHTML = files.map(f => '<li><span>' + f.name + '</span><span class="sz">' + fmtSize(f.size) + '</span></li>').join('');
+      fileList.innerHTML = files.map(f => '<li>📄 <span>' + f.name + '</span><span class="sz">' + fmtSize(f.size) + '</span></li>').join('');
       go.disabled = files.length === 0;
     }
 
@@ -108,21 +185,32 @@ const LANDING_HTML = `<!doctype html>
     drop.addEventListener('dragleave', () => drop.classList.remove('over'));
     drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); setFiles(e.dataTransfer.files); });
 
+    const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    const prettyKey = k => k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    function valHtml(k, v) {
+      if (v === true) return k.includes('verified') ? '<span class="chip ok">✓ verified</span>' : '<span class="chip ok">✓ yes</span>';
+      if (v === false) return k.includes('verified') ? '<span class="chip warn">⚠ unverified</span>' : '<span class="chip warn">⚠ no</span>';
+      if (v === null || v === undefined || v === '') return '<span class="muted">—</span>';
+      return esc(v);
+    }
+
     function render(records) {
+      if (!records.length) { results.innerHTML = ''; return; }
       results.innerHTML = records.map(r => {
         if (r.error) {
-          return '<div class="rec err"><h3>' + (r.source_file || 'error') + '</h3>' +
-                 '<div class="errmsg">⚠ ' + r.error + '</div></div>';
+          return '<div class="rec err"><div class="rec-head"><span class="fn">' + esc(r.source_file || 'error') +
+                 '</span></div><div class="errmsg">⚠ ' + esc(r.error) + '</div></div>';
         }
         const skip = new Set(['source_file', 'page', 'document_type', 'raw_text']);
         const rows = Object.keys(r).filter(k => !skip.has(k))
-          .map(k => '<tr><td class="k">' + k + '</td><td class="v">' + (r[k] ?? '—') + '</td></tr>').join('');
+          .map(k => '<dt>' + prettyKey(k) + '</dt><dd>' + valHtml(k, r[k]) + '</dd>').join('');
         const raw = r.raw_text ? '<details class="raw"><summary>raw OCR text</summary><pre>' +
-          r.raw_text.replace(/</g, '&lt;') + '</pre></details>' : '';
-        return '<div class="rec"><h3>' + (r.source_file || 'file') +
-          '<span class="badge">' + (r.document_type || 'UNKNOWN') + '</span></h3>' +
-          '<div class="meta">' + (r.page || '') + '</div>' +
-          '<table>' + rows + '</table>' + raw + '</div>';
+          esc(r.raw_text) + '</pre></details>' : '';
+        return '<div class="rec"><div class="rec-head">' +
+          '<span class="fn">' + esc(r.source_file || 'file') + '</span>' +
+          (r.page ? '<span class="pg">' + esc(r.page) + '</span>' : '') +
+          '<span class="badge">' + esc(r.document_type || 'UNKNOWN') + '</span></div>' +
+          '<dl>' + rows + '</dl>' + raw + '</div>';
       }).join('');
     }
 
@@ -130,7 +218,7 @@ const LANDING_HTML = `<!doctype html>
       if (!files.length) return;
       const fd = new FormData();
       files.forEach(f => fd.append('files', f));
-      go.disabled = true; spin.style.display = 'inline'; results.innerHTML = '';
+      go.disabled = true; spin.style.display = 'flex'; results.innerHTML = '';
       try {
         const url = '/ocr' + (document.getElementById('raw').checked ? '?raw=1' : '');
         const res = await fetch(url, { method: 'POST', body: fd });
@@ -184,6 +272,12 @@ app.post("/ocr", upload.any(), async (req, res) => {
       for (const page of pages) {
         const text = await ocrBest(page.buffer);
         const rec = detectAndExtract(text);
+        // Aadhaar QR (when present) is authoritative — overrides OCR guesses.
+        try {
+          applyQr(rec, await readAadhaarQr(page.buffer));
+        } catch {
+          /* QR is best-effort; ignore decode errors */
+        }
         rec.source_file = file.originalname;
         rec.page = page.label;
         if (wantRaw) rec.raw_text = text;
@@ -207,7 +301,7 @@ const PORT = Number(process.env.PORT) || 3001;
 initOcr()
   .then(() => {
     const server = app.listen(PORT, () => {
-      console.log(`ID OCR service listening on http://localhost:${PORT}`);
+      console.log(`CardSense listening on http://localhost:${PORT}`);
     });
     const stop = async () => {
       server.close();

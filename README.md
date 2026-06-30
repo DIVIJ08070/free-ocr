@@ -1,4 +1,4 @@
-# Indian ID OCR — Web Service (Node.js)
+# CardSense — Smart ID OCR (Node.js)
 
 Offline OCR HTTP service for Indian ID documents. **100% local** — no cloud OCR,
 no API keys, no per-call cost. OCR runs in-process via `tesseract.js` (WebAssembly),

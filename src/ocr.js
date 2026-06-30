@@ -4,9 +4,13 @@
 
 import sharp from "sharp";
 import { createWorker, createScheduler } from "tesseract.js";
-import { hasValidId, harvestIdNumbers } from "./extract.js";
+import { hasValidId, hasStrictId, harvestIdNumbers } from "./extract.js";
 
 let scheduler = null;
+// A dedicated worker (outside the scheduler) for the ID-number sweep, locked to
+// sparse-text mode + an alphanumeric whitelist so it can't emit the lowercase /
+// punctuation noise that corrupts ID numbers — kills O/0, I/1, S/5 at source.
+let fieldWorker = null;
 
 // Spin up a pool of Tesseract workers once at startup. The scheduler queues
 // jobs across workers, so concurrent HTTP requests share the pool safely.
@@ -18,6 +22,12 @@ export async function initOcr(numWorkers = Number(process.env.OCR_WORKERS) || 2)
     await worker.setParameters({ tessedit_pageseg_mode: "6" }); // PSM 6: assume a uniform block of text
     scheduler.addWorker(worker);
   }
+  fieldWorker = await createWorker("eng");
+  await fieldWorker.setParameters({
+    tessedit_pageseg_mode: "11", // PSM 11: sparse text — find ID tokens anywhere
+    tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ",
+    user_defined_dpi: "300",
+  });
   return scheduler;
 }
 
@@ -25,6 +35,10 @@ export async function shutdownOcr() {
   if (scheduler) {
     await scheduler.terminate();
     scheduler = null;
+  }
+  if (fieldWorker) {
+    await fieldWorker.terminate();
+    fieldWorker = null;
   }
 }
 
@@ -138,14 +152,18 @@ export async function ocrBest(inputBuffer) {
   // append them — the positional fields still come from the main pass above.
   // Re-derive from the ORIGINAL input at 3000px (the main pass is capped lower,
   // and small ID text needs the extra pixels), reusing the detected orientation.
-  if (!hasValidId(bestText)) {
+  if (!hasStrictId(bestText)) {
     const exifGray = await sharp(inputBuffer).rotate().grayscale().toBuffer();
     const sweep = await rotate(exifGray, deg)
       .resize({ width: 3000, height: 3000, fit: "inside", kernel: "cubic" })
       .normalize()
       .png()
       .toBuffer();
-    const sweepText = await scheduler.addJob("recognize", sweep).then((r) => r.data.text);
+    // Use the alphanumeric-whitelisted field worker so the recovered number is
+    // clean (no O/0 or I/1 noise); fall back to the scheduler if unavailable.
+    const sweepText = fieldWorker
+      ? await fieldWorker.recognize(sweep).then((r) => r.data.text)
+      : await scheduler.addJob("recognize", sweep).then((r) => r.data.text);
     const ids = harvestIdNumbers(sweepText);
     if (ids.length) bestText += "\n" + ids.join("\n");
   }

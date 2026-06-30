@@ -1,7 +1,7 @@
 {
-  "name": "id-ocr-service",
+  "name": "cardsense",
   "version": "1.0.0",
-  "description": "Offline OCR web service for Indian ID documents (PAN, Aadhaar, Voter ID, DL, Passport). 100% local — no cloud OCR.",
+  "description": "CardSense — smart offline OCR for Indian ID documents (PAN, Aadhaar, Voter ID, DL, Passport). 100% local, no cloud OCR.",
   "type": "module",
   "main": "src/server.js",
   "scripts": {
@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
+    "jsqr": "^1.4.0",
     "multer": "^2.0.0",
     "pdf-to-png-converter": "^3.3.0",
     "sharp": "^0.33.4",
