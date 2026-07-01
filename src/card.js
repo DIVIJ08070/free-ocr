@@ -246,6 +246,9 @@ const SOCIAL_LABEL = /^(?:you\s*tube|youtube|google(?:\s*reviews?)?|gog|instagra
 // A name following an honorific anywhere in a line ("MD(A.M) Dr. Chirag Dhakkaan"
 // → "Chirag Dhakkaan"). Very reliable for professionals/doctors.
 const HON_NAME = /\b(?:Dr|Mr|Mrs|Ms|Miss|Prof|Shri|Smt|Sri)\.?\s+([A-Z][a-zA-Z.'’-]+(?:\s+[A-Z][a-zA-Z.'’-]+){0,2})/;
+// Single words that are categorically NOT a person's name (countries, places,
+// labels). Universal — applies to every card, not a specific one.
+const NAME_STOP = /^(?:india|usa|uk|uae|america|england|bharat|office|regd|registered|head|branch|mobile|phone|email|address|contact|website|director|founder|manager|owner|proprietor|prop)$/i;
 
 // Does a line look like a person's name (not a brand, title, tagline, social
 // label, or contact)? General, structural — no per-card vocabularies.
@@ -259,6 +262,7 @@ function looksName(t) {
   if (!(nameWords.length >= 1 && nameWords.length <= 3 && words.every(NAME_WORD))) return false;
   if (t.replace(/[^A-Za-z]/g, "").length < 3) return false;
   if (nameWords.length === 1 && /^[A-Z0-9.]{1,4}$/.test(nameWords[0])) return false; // logo acronym like "YOS"
+  if (nameWords.length === 1 && NAME_STOP.test(nameWords[0].replace(/[^A-Za-z]/g, ""))) return false; // "India", "Office"…
   return true;
 }
 
@@ -272,8 +276,11 @@ const isContactBlock = (t) => /@/.test(t) || /(?:\+?\d[\d\s().-]{7,}\d)/.test(t)
 function nameScore(l, med, desig, pageMaxY, contacts) {
   const t = l.text.trim();
   let s = 0;
+  const words = t.split(/\s+/).filter((w) => !HONORIFIC.test(w));
   if (/\b[A-Z]\.?$/.test(t)) s += 1.2;                  // has an initial, e.g. "V."
   if (/^[A-Z][a-z]/.test(t)) s += 0.5;                  // proper-case first word
+  if (words.length === 2 || words.length === 3) s += 1.0; // real names are usually 2–3 tokens
+  if (/^[A-Z0-9 .&]+$/.test(t) && words.length >= 3) s -= 1.8; // long ALL-CAPS → brand/tagline ("THEINDIAN YOGA SHOP")
   if (desig && l.page === desig.page) {                 // adjacency to the title (same side)
     const dy = (l.y || 0) - (desig.y || 0);
     if (dy < 0 && -dy < med * 4) s += 3;
@@ -305,16 +312,15 @@ function pickFromGeometry(lines, med, name0) {
   for (const l of lines) { const k = norm(l.text); if (k.length >= 3) (pagesOf[k] = pagesOf[k] || new Set()).add(l.page); }
   const repeated = (l) => { const s = pagesOf[norm(l.text)]; return s && s.size > 1; };
 
+  // Score ALL name candidates together (word-count is now a score factor, not a
+  // hard filter) so a single-word name beside the contacts ("VAISHNAVIV.") beats
+  // a 3-word logo tagline ("THEINDIAN YOGA SHOP") on the other side.
   const nameCands = lines.filter((l) => looksName(l.text.trim()) && !repeated(l));
-  // Prefer multi-token candidates — a real name ("VAISHNAVI V.") beats a lone
-  // generic word ("India"); fall back to single-token only if nothing else.
-  const multi = nameCands.filter((l) => l.text.trim().split(/\s+/).filter((w) => !HONORIFIC.test(w)).length >= 2);
-  const pool = multi.length ? multi : nameCands;
   const pageMaxY = {};
   for (const l of lines) pageMaxY[l.page || 0] = Math.max(pageMaxY[l.page || 0] || 1, l.y || 0);
   const contacts = lines.filter((l) => isContactBlock(l.text));
-  pool.sort((a, b) => nameScore(b, med, desig, pageMaxY, contacts) - nameScore(a, med, desig, pageMaxY, contacts));
-  if (pool.length) out.name = pool[0].text.trim();
+  nameCands.sort((a, b) => nameScore(b, med, desig, pageMaxY, contacts) - nameScore(a, med, desig, pageMaxY, contacts));
+  if (nameCands.length) out.name = nameCands[0].text.trim();
   const chosenName = out.name || name0;
 
   // company: legal suffix wins; else a brand repeated on both sides; else a

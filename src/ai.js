@@ -57,11 +57,23 @@ function parseLoose(s) {
 export function aiProvider() {
   // `model` = vision model (image path); `textModel` = cheap text model used to
   // map already-OCR'd text → fields (no image tokens, ~5× cheaper).
+  // Gemini (if its key is set) is preferred and runs the VISION path — it reads
+  // the card image directly, so it fixes OCR merges/garble the text path can't.
+  if (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) {
+    const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+    const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+    return {
+      name: "gemini", kind: "openai", vision: true, apiKey,
+      baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+      model, textModel: model,
+    };
+  }
   if (process.env.GROQ_API_KEY) {
     return { name: "groq", kind: "openai", apiKey: process.env.GROQ_API_KEY,
       baseURL: "https://api.groq.com/openai/v1",
       model: process.env.GROQ_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct",
-      textModel: process.env.GROQ_TEXT_MODEL || "llama-3.3-70b-versatile" };
+      textModel: process.env.GROQ_TEXT_MODEL || "llama-3.3-70b-versatile",
+      textModelFallback: process.env.GROQ_TEXT_FALLBACK || "llama-3.1-8b-instant" };
   }
   if (process.env.XAI_API_KEY) {
     return { name: "xai", kind: "openai", apiKey: process.env.XAI_API_KEY,
@@ -102,10 +114,11 @@ function normalize(obj, provider, usage) {
 }
 
 async function toJpegB64(buffer) {
+  // Higher res = better accuracy on dense/small-text cards (Gemini tiles it).
   const jpeg = await sharp(buffer)
     .rotate()
-    .resize({ width: 1400, height: 1400, fit: "inside", withoutEnlargement: true })
-    .jpeg({ quality: 85 })
+    .resize({ width: 2048, height: 2048, fit: "inside", withoutEnlargement: true })
+    .jpeg({ quality: 92 })
     .toBuffer();
   return jpeg.toString("base64");
 }
@@ -201,6 +214,7 @@ const MAP_SYSTEM =
   "Use the email to find and confirm the correct name in the text, even if it's buried mid-line. " +
   "IGNORE handwritten notes, logos, brand wordmarks, and slogans; a name-like line unrelated to the email/contacts is likely a stray note. " +
   "Strip honorifics (Dr/Mr/Mrs/Ms/Shri) from name. Do not include membership badges (BNI, Rotary, Lions Club, ISO) in the name or designation. " +
+  "A country, state, city, or place name (e.g. India) is NEVER the person's name. " +
   "designation = the person's job title — set it ONLY if the line is clearly a standard job title " +
   '(Manager, Engineer, Director, Founder, CEO, Stylist, etc.). If a line is garbled, ambiguous, or not clearly a title, leave designation "". ' +
   "company = the business name (prefer a full legal name or the main brand), not the person. " +
@@ -225,42 +239,119 @@ function finalizeMap(data, p, usage) {
   return out;
 }
 
-async function mapViaOpenAI(p, text) {
+async function mapViaOpenAI(p, text, model) {
   const { default: OpenAI } = await import("openai");
   const client = new OpenAI({ apiKey: p.apiKey, baseURL: p.baseURL });
   const res = await client.chat.completions.create({
-    model: p.textModel,
-    max_tokens: 800,
+    model,
+    max_tokens: 2048,
     temperature: 0,
     response_format: { type: "json_object" },
+    ...(p.name === "gemini" ? { reasoning_effort: "none" } : {}), // Gemini thinks by default; not for Groq
     messages: [
       { role: "system", content: MAP_SYSTEM },
       { role: "user", content: "OCR text from the card:\n" + text },
     ],
   });
   const data = parseLoose(res.choices[0].message.content);
-  return finalizeMap(data, p, res.usage && { input: res.usage.prompt_tokens, output: res.usage.completion_tokens });
+  return finalizeMap(data, { ...p, textModel: model }, res.usage && { input: res.usage.prompt_tokens, output: res.usage.completion_tokens });
 }
 
-async function mapViaAnthropic(p, text) {
+async function mapViaAnthropic(p, text, model) {
   const { default: Anthropic } = await import("@anthropic-ai/sdk");
   const client = new Anthropic({ apiKey: p.apiKey });
   const res = await client.messages.create({
-    model: p.textModel,
+    model,
     max_tokens: 800,
     system: MAP_SYSTEM,
     messages: [{ role: "user", content: "OCR text from the card:\n" + text }],
   });
   const block = res.content.find((b) => b.type === "text");
   const data = parseLoose(block ? block.text : "");
-  return finalizeMap(data, p, res.usage && { input: res.usage.input_tokens, output: res.usage.output_tokens });
+  return finalizeMap(data, { ...p, textModel: model }, res.usage && { input: res.usage.input_tokens, output: res.usage.output_tokens });
 }
 
 export async function mapCardWithAI(text) {
   const p = aiProvider();
   if (!p) throw new Error("No AI key set — add GROQ_API_KEY (or XAI / OPENAI / ANTHROPIC) to .env");
   if (!text || !text.trim()) throw new Error("no OCR text to map");
-  return p.kind === "anthropic" ? mapViaAnthropic(p, text) : mapViaOpenAI(p, text);
+  // Try the primary model, then the fallback model (e.g. 70B rate-limited → 8B).
+  // Staying on AI keeps the name right; the messy rules are only a last resort.
+  const models = [p.textModel, p.textModelFallback].filter((m, i, a) => m && a.indexOf(m) === i);
+  let lastErr;
+  for (const m of models) {
+    try {
+      return p.kind === "anthropic" ? await mapViaAnthropic(p, text, m) : await mapViaOpenAI(p, text, m);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("AI mapping failed");
+}
+
+// Force the Groq text-mapper regardless of which provider aiProvider() picks —
+// used as a fallback when the primary (Gemini vision) is rate-limited/unavailable.
+export async function groqTextMap(text) {
+  if (!process.env.GROQ_API_KEY) throw new Error("no GROQ_API_KEY for fallback");
+  if (!text || !text.trim()) throw new Error("no OCR text to map");
+  const p = {
+    name: "groq", kind: "openai", apiKey: process.env.GROQ_API_KEY, baseURL: "https://api.groq.com/openai/v1",
+    textModel: process.env.GROQ_TEXT_MODEL || "llama-3.3-70b-versatile",
+    textModelFallback: process.env.GROQ_TEXT_FALLBACK || "llama-3.1-8b-instant",
+  };
+  const models = [p.textModel, p.textModelFallback].filter((m, i, a) => m && a.indexOf(m) === i);
+  let lastErr;
+  for (const m of models) {
+    try { return await mapViaOpenAI(p, text, m); } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error("groq fallback failed");
+}
+
+// ── Vision mapping (Gemini) ──────────────────────────────────────────────────
+// Reads the card IMAGE(s) directly (no OCR) — recovers merged/garbled text the
+// text path can't ("VAISHNAVIV." → "Vaishnavi V.", handwriting vs print, etc).
+const VISION_SYSTEM =
+  "You are given photo(s) of ONE business card (possibly its front and back). Read the card and return a JSON contact record. " +
+  "Return every field in the SAME language and script exactly as printed on the card — do NOT translate or romanize (Gujarati text stays in Gujarati, Hindi stays in Hindi). Read the script accurately. " +
+  "name = the cardholder's FULL personal name — NOT a company, brand, logo, or job title. Strip honorifics (Dr/Mr/Mrs/Shri). " +
+  "If the card lists MORE THAN ONE person, put the FIRST/topmost person in name, and add each OTHER person to extras (label 'Other contact'). Never merge two people into one name. " +
+  "A country/state/city/place name (e.g. India), social-platform labels (YouTube, Google, Instagram, Facebook), membership badges (BNI, Rotary), and religious phrases / slogans / blessings (e.g. 'Sabka Malik Ek', 'Jai Mataji') are NEVER the name or the designation. " +
+  "designation = the job title only if a real title is clearly printed (Chairman, Secretary, Owner, Proprietor, Manager, etc.). company = the business name, not the person. " +
+  "Operating hours/timings, appointment instructions, addresses, and taglines are NOT the company. " +
+  "Keep phone numbers with their country code. website = the web address, not an email. " +
+  "instagram/youtube/facebook/linkedin = the handle or URL if present. " +
+  "Respond ONLY with a JSON object with these keys: " + MAP_FIELDS.join(", ") +
+  ', confidence (one of "high","medium","low"), and extras (an array of {"label","value"} objects for other useful details — other people, services, tagline, hours; [] if none). ' +
+  "Use an empty string for any absent field. No markdown, no commentary.";
+
+export async function visionCardWithAI(input) {
+  const p = aiProvider();
+  if (!p) throw new Error("No AI key set — add GEMINI_API_KEY (or GROQ / OPENAI / ANTHROPIC) to .env");
+  const buffers = (Array.isArray(input) ? input : [input]).slice(0, 4);
+  const b64s = await Promise.all(buffers.map(toJpegB64));
+  const { default: OpenAI } = await import("openai");
+  const client = new OpenAI({ apiKey: p.apiKey, baseURL: p.baseURL });
+  const res = await client.chat.completions.create({
+    model: p.model,
+    max_tokens: 2048, // headroom so the JSON is never truncated
+    temperature: 0,
+    response_format: { type: "json_object" },
+    reasoning_effort: "none", // Gemini 2.5 "thinks" by default — off = no truncation, faster, cheaper
+    messages: [
+      { role: "system", content: VISION_SYSTEM },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Extract the contact details from this business card." },
+          ...b64s.map((b) => ({ type: "image_url", image_url: { url: `data:image/jpeg;base64,${b}` } })),
+        ],
+      },
+    ],
+  });
+  const data = parseLoose(res.choices[0].message.content);
+  const out = finalizeMap(data, { ...p, textModel: p.model }, res.usage && { input: res.usage.prompt_tokens, output: res.usage.completion_tokens });
+  out.source = "ai-vision";
+  return out;
 }
 
 // Accepts a single image buffer or an array of buffers (front/back/extra photos

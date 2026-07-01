@@ -26,7 +26,7 @@ import { detectAndExtract } from "./extract.js";
 import { renderPdfToImages } from "./pdf.js";
 import { readAadhaarQr } from "./qr.js";
 import { extractCard, extractCardSmart, localWeak } from "./card.js";
-import { extractCardWithAI, mapCardWithAI, aiAvailable, aiProvider } from "./ai.js";
+import { extractCardWithAI, mapCardWithAI, visionCardWithAI, groqTextMap, aiAvailable, aiProvider } from "./ai.js";
 import { CARD_PAGE_HTML } from "./cardpage.js";
 
 // When an Aadhaar Secure QR decodes, its UIDAI-signed fields are ground truth —
@@ -598,7 +598,19 @@ app.post("/card", upload.any(), async (req, res) => {
     const wantAi = mode !== "local";
     if (wantAi && haveAi) {
       try {
-        rec = await mapCardWithAI(text);
+        const p = aiProvider();
+        if (p && p.vision) {
+          // Gemini vision (most accurate). If it's rate-limited, fall back to
+          // Groq text mapping (still AI) before ever touching the local rules.
+          try {
+            rec = await visionCardWithAI(buffers);
+          } catch (ve) {
+            rec = await groqTextMap(text);
+            rec.ai_note = "Gemini unavailable (" + String(ve.message).slice(0, 40) + ") — used Groq";
+          }
+        } else {
+          rec = await mapCardWithAI(text);
+        }
         aiUsed = true;
       } catch (e) {
         // AI hiccup (rate limit / bad reply / network) — never fail the request.

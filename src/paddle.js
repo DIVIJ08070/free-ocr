@@ -59,25 +59,17 @@ async function detectFile(ocr, buf) {
 // total high-confidence text — used to pick the upright orientation
 const scoreArr = (arr) => arr.reduce((s, l) => s + (l.mean || 0) * (l.text ? l.text.length : 0), 0);
 
-export async function ocrCardPaddle(inputBuffer) {
-  const ocr = await engine();
-  if (!ocr) return null;
-  const oriented = await sharp(inputBuffer).rotate().toFormat("png").toBuffer(); // EXIF-correct once
+// Does an upright read already look complete enough to skip the rotation search?
+function looksGood(arr) {
+  if (arr.length < 3) return false;
+  const txt = arr.map((l) => l.text || "").join(" ");
+  const hasContact =
+    /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.test(txt) || txt.replace(/\D/g, "").length >= 8;
+  const words = (txt.match(/\b[A-Za-z]{2,}\b/g) || []).length;
+  return hasContact || words >= 6;
+}
 
-  // 1) Cheap orientation probe on a small image — pick the upright 90° rotation.
-  const small = await sharp(oriented).resize({ width: 720, withoutEnlargement: true }).toFormat("png").toBuffer();
-  let bestDeg = 0, bestScore = -1;
-  for (const deg of ROT) {
-    const r = deg ? await sharp(small).rotate(deg).toFormat("png").toBuffer() : small;
-    const sc = scoreArr(await detectFile(ocr, r));
-    if (sc > bestScore) { bestScore = sc; bestDeg = deg; }
-  }
-
-  // 2) ONE full-resolution read at the chosen rotation (the accurate, costly pass).
-  const full = await sharp(oriented).resize({ width: 1600, withoutEnlargement: true }).rotate(bestDeg).toFormat("png").toBuffer();
-  const arr = await detectFile(ocr, full);
-  if (!arr.length) return null;
-
+function toResult(arr) {
   const lines = arr
     .map((l) => {
       const g = boxGeom(l.box || l.frame || l.points || l.bbox);
@@ -92,4 +84,30 @@ export async function ocrCardPaddle(inputBuffer) {
     .filter((l) => l.text);
   lines.sort((a, b) => a.y - b.y);
   return { text: lines.map((l) => l.text).join("\n"), lines };
+}
+
+export async function ocrCardPaddle(inputBuffer) {
+  const ocr = await engine();
+  if (!ocr) return null;
+  const oriented = await sharp(inputBuffer).rotate().toFormat("png").toBuffer(); // EXIF-correct once
+
+  // FAST PATH: read once upright. Most phone scans are roughly upright, so if
+  // this already looks complete we skip the (4× slower) rotation search.
+  const full0 = await sharp(oriented).resize({ width: 1600, withoutEnlargement: true }).toFormat("png").toBuffer();
+  const arr0 = await detectFile(ocr, full0);
+  if (looksGood(arr0)) return toResult(arr0);
+
+  // Otherwise the card may be sideways: probe 90/180/270 on a small image
+  // (0° is already scored from arr0) and only re-read full-res if a turn wins.
+  const small = await sharp(oriented).resize({ width: 720, withoutEnlargement: true }).toFormat("png").toBuffer();
+  let bestDeg = 0, bestScore = scoreArr(arr0);
+  for (const deg of [90, 180, 270]) {
+    const sc = scoreArr(await detectFile(ocr, await sharp(small).rotate(deg).toFormat("png").toBuffer()));
+    if (sc > bestScore) { bestScore = sc; bestDeg = deg; }
+  }
+  if (bestDeg === 0) return arr0.length ? toResult(arr0) : null;
+
+  const full = await sharp(oriented).resize({ width: 1600, withoutEnlargement: true }).rotate(bestDeg).toFormat("png").toBuffer();
+  const arr = await detectFile(ocr, full);
+  return arr.length ? toResult(arr) : (arr0.length ? toResult(arr0) : null);
 }
